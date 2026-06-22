@@ -7,6 +7,7 @@ import android.app.Service
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
+import android.os.BatteryManager
 import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
@@ -15,6 +16,13 @@ import android.util.Log
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
+import okhttp3.MediaType.Companion.toMediaType
+import okhttp3.OkHttpClient
+import okhttp3.Request
+import okhttp3.RequestBody.Companion.toRequestBody
+import org.json.JSONArray
+import org.json.JSONObject
+import java.util.concurrent.TimeUnit
 
 class LoggingService : Service() {
 
@@ -29,6 +37,9 @@ class LoggingService : Service() {
             if (isRunning) {
                 CoroutineScope(Dispatchers.IO).launch {
                     logBatteryData()
+                    // Upload on every foreground service cycle too —
+                    // dual upload path: alarm + service, independent of each other
+                    uploadPendingLogs()
                 }
                 handler.postDelayed(this, logInterval)
             }
@@ -42,6 +53,17 @@ class LoggingService : Service() {
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        if (intent?.action == "STOP") {
+            Log.d("LoggingService", "Stop action received")
+            isRunning = false
+            handler.removeCallbacks(logRunnable)
+            unregisterScreenReceiver()
+            releaseWakeLock()
+            stopForeground(STOP_FOREGROUND_REMOVE)
+            stopSelf()
+            return START_NOT_STICKY
+        }
+
         if (isRunning) {
             Log.d("LoggingService", "Already running — ignoring duplicate start")
             return START_STICKY
@@ -64,15 +86,26 @@ class LoggingService : Service() {
         handler.removeCallbacks(logRunnable)
         unregisterScreenReceiver()
         releaseWakeLock()
-        Log.d("LoggingService", "Service destroyed — scheduling alarm restart fallback")
+        Log.d("LoggingService", "Service destroyed — rescheduling alarm as fallback")
         AlarmReceiver.scheduleNextAlarm(applicationContext)
     }
 
     override fun onTaskRemoved(rootIntent: Intent?) {
         super.onTaskRemoved(rootIntent)
-        Log.d("LoggingService", "Task removed — restarting service")
-        val restartIntent = Intent(applicationContext, LoggingService::class.java)
-        startForegroundService(restartIntent)
+        Log.d("LoggingService", "Task removed (swiped away) — rescheduling alarm + restarting service")
+
+        // Reschedule alarm FIRST — this fires before process dies, so alarm survives
+        // even if the service restart below fails
+        AlarmReceiver.scheduleNextAlarm(applicationContext)
+
+        // Try to restart the service — succeeds if battery exemption is granted
+        try {
+            val restartIntent = Intent(applicationContext, LoggingService::class.java)
+            startForegroundService(restartIntent)
+        } catch (e: Exception) {
+            Log.e("LoggingService", "Service restart after swipe failed: ${e.message}")
+            // Alarm reschedule above already handles recovery
+        }
     }
 
     private fun acquireWakeLock() {
@@ -82,7 +115,7 @@ class LoggingService : Service() {
                 PowerManager.PARTIAL_WAKE_LOCK,
                 "BatteryStudy::LoggingWakeLock"
             )
-            wakeLock?.acquire(24 * 60 * 60 * 1000L) // 24h max, refreshed on restart
+            wakeLock?.acquire(24 * 60 * 60 * 1000L)
             Log.d("LoggingService", "WakeLock acquired")
         } catch (e: Exception) {
             Log.e("LoggingService", "WakeLock error: ${e.message}")
@@ -91,9 +124,7 @@ class LoggingService : Service() {
 
     private fun releaseWakeLock() {
         try {
-            wakeLock?.let {
-                if (it.isHeld) it.release()
-            }
+            wakeLock?.let { if (it.isHeld) it.release() }
             wakeLock = null
         } catch (e: Exception) {
             Log.e("LoggingService", "WakeLock release error: ${e.message}")
@@ -127,9 +158,7 @@ class LoggingService : Service() {
     }
 
     private fun logBatteryData() {
-        val prefs = getSharedPreferences(
-            "FlutterSharedPreferences", Context.MODE_PRIVATE
-        )
+        val prefs = getSharedPreferences("FlutterSharedPreferences", Context.MODE_PRIVATE)
         val loggingActive = prefs.getBoolean("flutter.logging_active", true)
         if (!loggingActive) return
 
@@ -141,10 +170,8 @@ class LoggingService : Service() {
 
         if (weatherData.success) {
             prefs.edit()
-                .putFloat("cached_ambient_temp",
-                    weatherData.ambientTemperature.toFloat())
-                .putFloat("cached_humidity",
-                    weatherData.humidity.toFloat())
+                .putFloat("cached_ambient_temp", weatherData.ambientTemperature.toFloat())
+                .putFloat("cached_humidity", weatherData.humidity.toFloat())
                 .apply()
         }
 
@@ -176,8 +203,83 @@ class LoggingService : Service() {
             deviceModel = data.deviceModel,
             osVersion = data.osVersion
         )
-        Log.d("LoggingService", "Logged SoC:${data.soc}% " +
-                "HealthState:${data.batteryHealthState}")
+        Log.d("LoggingService", "Logged SoC:${data.soc}% HealthState:${data.batteryHealthState}")
+    }
+
+    /**
+     * Upload pending logs to server — called every 10 min from the foreground service timer.
+     * This is the SECOND upload path (first is AlarmReceiver every 15 min).
+     * Having two independent upload paths means internet-available data reaches
+     * the server regardless of which path is alive at any given moment.
+     */
+    private fun uploadPendingLogs() {
+        val db = BatteryDatabase(this)
+        val logs = db.getUnuploadedLogs()
+
+        if (logs.isEmpty()) {
+            Log.d("LoggingService", "No pending logs to upload")
+            return
+        }
+
+        Log.d("LoggingService", "Service uploading ${logs.size} pending logs")
+
+        try {
+            val logsArray = JSONArray()
+            val idsToMark = mutableListOf<Int>()
+
+            for (log in logs) {
+                val obj = JSONObject()
+                obj.put("userId", log["userId"] ?: "UNKNOWN")
+                obj.put("deviceBrand", log["deviceBrand"] ?: "")
+                obj.put("deviceModel", log["deviceModel"] ?: "")
+                obj.put("osVersion", log["osVersion"] ?: "")
+                obj.put("batterySoc", (log["batterySoc"] as? String)?.toIntOrNull() ?: -1)
+                obj.put("batteryTemperatureC", (log["batteryTemperatureC"] as? String)?.toDoubleOrNull() ?: -1.0)
+                obj.put("batteryVoltageMv", (log["batteryVoltageMv"] as? String)?.toIntOrNull() ?: -1)
+                obj.put("chargingStatus", log["chargingStatus"] ?: "UNKNOWN")
+                obj.put("chargingSource", log["chargingSource"] ?: "UNKNOWN")
+                obj.put("isCharging", (log["isCharging"] as? String)?.toIntOrNull() ?: -1)
+                obj.put("screenOn", (log["screenOn"] as? String)?.toIntOrNull() ?: -1)
+                obj.put("chargingCurrentMa", (log["chargingCurrentMa"] as? String)?.toDoubleOrNull() ?: -1.0)
+                obj.put("remainingCapacityMah", (log["remainingCapacityMah"] as? String)?.toDoubleOrNull() ?: -1.0)
+                obj.put("batteryHealthPercent", (log["batteryHealthPercent"] as? String)?.toDoubleOrNull() ?: -1.0)
+                obj.put("batteryHealthState", log["batteryHealthState"] ?: "UNKNOWN")
+                obj.put("timestamp", log["timestamp"] ?: "")
+                obj.put("ambientTemperatureC", (log["ambientTemperatureC"] as? String)?.toDoubleOrNull() ?: -1.0)
+                obj.put("humidity", (log["humidity"] as? String)?.toDoubleOrNull() ?: -1.0)
+                obj.put("cityName", log["cityName"] ?: "")
+                obj.put("logSource", log["logSource"] ?: "UNKNOWN")
+                logsArray.put(obj)
+                (log["id"] as? String)?.toIntOrNull()?.let { idsToMark.add(it) }
+            }
+
+            val payload = JSONObject()
+            payload.put("logs", logsArray)
+
+            // 60s timeouts — handles Render free tier cold starts (30-50s to wake)
+            val client = OkHttpClient.Builder()
+                .connectTimeout(60, TimeUnit.SECONDS)
+                .writeTimeout(60, TimeUnit.SECONDS)
+                .readTimeout(60, TimeUnit.SECONDS)
+                .build()
+
+            val body = payload.toString().toRequestBody("application/json".toMediaType())
+            val request = Request.Builder()
+                .url("https://battery-backend-t82v.onrender.com/logs")
+                .post(body)
+                .build()
+
+            client.newCall(request).execute().use { response ->
+                if (response.isSuccessful) {
+                    db.markAsUploaded(idsToMark)
+                    Log.d("LoggingService", "Service uploaded ${idsToMark.size} logs successfully")
+                } else {
+                    Log.e("LoggingService", "Service upload failed: HTTP ${response.code}")
+                }
+            }
+        } catch (e: Exception) {
+            Log.e("LoggingService", "Service upload exception: ${e.message}")
+        }
     }
 
     private fun createNotificationChannel() {

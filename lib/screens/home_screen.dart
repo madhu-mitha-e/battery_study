@@ -4,6 +4,7 @@ import 'dart:async';
 import '../services/background_service.dart';
 import '../services/battery_service.dart';
 import '../services/weather_service.dart';
+import 'package:flutter/foundation.dart';
 
 class HomeScreen extends StatefulWidget {
   const HomeScreen({super.key});
@@ -225,10 +226,10 @@ class _HomeScreenState extends State<HomeScreen> {
               const SizedBox(height: 16),
               _buildStatsCard(),
               const SizedBox(height: 16),
-              _buildManualLogButton(),
-              const SizedBox(height: 12),
-              _buildUploadButton(),
-              const SizedBox(height: 12),
+              if (kDebugMode) _buildManualLogButton(),
+              if (kDebugMode) const SizedBox(height: 12),
+              if (kDebugMode) _buildUploadButton(),
+              if (kDebugMode) const SizedBox(height: 12),
               _buildToggleButton(),
             ],
           ),
